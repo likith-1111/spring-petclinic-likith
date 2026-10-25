@@ -1,30 +1,18 @@
-namespace: petclinic-dev
-mysql:
-  enabled: true  # Added this to control the conditional creation
-  image: mysql:8.4
-  username: petclinic
-  password: petclinic
-  rootPassword: root
-  database: petclinic
-  service:
-    type: ClusterIP
-    port: 3306
-  storage:
-    size: 8Gi
-    className: manual
-  # Removed nodeSelector since we're now using zone-based affinity in the deployment template
-  # The zone affinity is hardcoded in the deployment template to us-east-1b
-app:
-  image:
-    repository: 017820683847.dkr.ecr.us-east-1.amazonaws.com/petclinic-dev
-    tag: 395b703-18
-  replicas: 2
-  service:
-    type: LoadBalancer
-    port: 8081
-  env:
-    serverPort: 8081
-    mysqlUrl: jdbc:mysql://mysql-service:3306/petclinic
-labels:
-  app: petclinic
-  db: mysql
+replicaCount: 1
+
+image:
+  repository: petclinic-local
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: NodePort
+  port: 8081
+  targetPort: 8081
+  nodePort: 30081
+
+database:
+  host: mysql-service
+  port: 3306
+  name: petclinic
+  secretName: petclinic-db-secret
