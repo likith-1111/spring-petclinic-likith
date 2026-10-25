@@ -9,8 +9,7 @@ service:
   type: NodePort
   port: 8081
   targetPort: 8081
-  nodePort: 30081
-
+  nodePort: 30082
 database:
   host: mysql-service
   port: 3306
