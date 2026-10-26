@@ -1,0 +1,18 @@
+replicaCount: 1
+
+image:
+  repository: 141145000253.dkr.ecr.us-east-1.amazonaws.com/test-project1
+  tag: "18-eabb47e"
+  pullPolicy: Always
+
+service:
+  type: NodePort
+  port: 8081
+  targetPort: 8081
+  nodePort: 30083
+
+database:
+  host: mysql-service
+  port: 3306
+  name: petclinic
+  secretName: petclinic-db-secret
