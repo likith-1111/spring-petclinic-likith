@@ -1,186 +1,373 @@
 pipeline {
     agent any
 
-    tools {
-        jdk 'JDK 17'
-        maven 'maven 3.9.8'
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     environment {
-        GIT_REPO = 'https://github.com/SubbuTechOps/spring-petclinic.git'
-        GIT_BRANCH = 'develop'
-        GIT_CREDENTIALS_ID = 'github-pat'
+        AWS_REGION        = 'us-east-1'
+        AWS_ACCOUNT_ID    = '141145000253'
+        ECR_REPOSITORY    = 'test-project1'
+        ECR_REGISTRY      = '141145000253.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_IMAGE         = '141145000253.dkr.ecr.us-east-1.amazonaws.com/test-project1'
 
-        SONARQUBE_HOST_URL = 'http://13.201.52.196:9000/'
-        SONARQUBE_PROJECT_KEY = 'PetClinic'
-        SONARQUBE_TOKEN = credentials('sonar-credentials')
+        K8S_NAMESPACE     = 'petclinic'
+        HELM_RELEASE      = 'petclinic-helm'
+        HELM_CHART        = './petclinic-chart'
 
-        AWS_ACCOUNT_ID = '017820683847'
-        ECR_REPO_URL = '017820683847.dkr.ecr.us-east-1.amazonaws.com/petclinic-dev'
-        AWS_REGION = 'ap-south-1'
+        TRIVY_CACHE_DIR   = '/mnt/docker-data/trivy-cache'
 
-        EKS_CLUSTER_NAME = 'demo-cluster'
-        HELM_RELEASE_NAME = 'petclinic'
-        MYSQL_RELEASE_NAME = 'mysql'
-        HELM_NAMESPACE = 'petclinic-dev'
-        MYSQL_NAMESPACE = 'mysql-dev'
-        HELM_RELEASE_NAME_DB = 'mysql-release'
-
-        TRIVY_DB_CACHE = "/var/lib/jenkins/trivy-db"
+        SONAR_PROJECT_KEY = 'spring-petclinic-likith'
     }
 
     stages {
-        stage('Checkout Code') {
+        stage('Checkout') {
             steps {
-                git branch: "${GIT_BRANCH}", url: "${GIT_REPO}", credentialsId: "${GIT_CREDENTIALS_ID}"
-                stash name: 'source-code', includes: '**/*'
+                echo 'Checking out Spring PetClinic from develop'
+
+                git branch: 'develop',
+                    url: 'https://github.com/likith-1111/spring-petclinic-likith.git'
+
+                script {
+                    env.GIT_SHORT_COMMIT = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_SHORT_COMMIT}"
+                }
+
+                sh '''
+                    set -eu
+
+                    echo "Current branch:"
+                    git branch --show-current
+
+                    echo "Current commit:"
+                    git rev-parse --short HEAD
+
+                    echo "Docker image:"
+                    echo "$ECR_IMAGE:$IMAGE_TAG"
+
+                    echo "Disk space:"
+                    df -h / /mnt/docker-data
+
+                    test -f pom.xml
+                    test -f Dockerfile
+                    test -f "$HELM_CHART/Chart.yaml"
+                    test -f "$HELM_CHART/templates/deployment.yaml"
+                '''
             }
         }
 
-        stage('Trivy Scan Repository') {
+        stage('Maven Build and Test') {
             steps {
-                sh """
-                mkdir -p ${TRIVY_DB_CACHE}
-                trivy fs --cache-dir ${TRIVY_DB_CACHE} --exit-code 1 --severity HIGH,CRITICAL .
-                """
+                echo 'Building the application and running tests'
+
+                sh '''
+                    set -eu
+                    mvn -B clean verify
+                '''
+            }
+
+            post {
+                always {
+                    junit(
+                        allowEmptyResults: true,
+                        testResults: '**/target/surefire-reports/TEST-*.xml,**/target/failsafe-reports/TEST-*.xml'
+                    )
+                }
             }
         }
 
-        stage('Run Unit Tests') {
+        stage('Trivy Filesystem Scan') {
             steps {
-                sh 'mvn test -DskipTests=false'
-            }
-        }
+                echo 'Scanning project files for security findings'
 
-        stage('Generate JaCoCo Coverage Report') {
-            steps {
-                sh 'mvn jacoco:report'
+                sh '''
+                    set -eu
+
+                    mkdir -p "$TRIVY_CACHE_DIR"
+                    test -w "$TRIVY_CACHE_DIR"
+
+                    trivy fs \
+                        --cache-dir "$TRIVY_CACHE_DIR" \
+                        --scanners vuln,misconfig,secret \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        .
+                '''
             }
         }
 
         stage('SonarQube Analysis') {
             steps {
-                withSonarQubeEnv('sonar-server') {
-                    sh """
-                    mvn sonar:sonar \
-                    -Dsonar.projectKey=${SONARQUBE_PROJECT_KEY} \
-                    -Dsonar.host.url=${SONARQUBE_HOST_URL} \
-                    -Dsonar.login=${SONARQUBE_TOKEN}
-                    """
+                echo 'Running SonarQube analysis'
+
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        set -eu
+
+                        mvn -B sonar:sonar \
+                            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+                            -Dsonar.projectName="$SONAR_PROJECT_KEY"
+                    '''
                 }
             }
         }
 
-        stage('Build and Push Docker Image') {
+        stage('Quality Gate') {
             steps {
-                script {
-                    def COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                    env.IMAGE_TAG = "${COMMIT_HASH}-${BUILD_NUMBER}"
-                    env.DOCKER_IMAGE = "${ECR_REPO_URL}:${IMAGE_TAG}"
+                echo 'Waiting for the SonarQube Quality Gate'
 
-                    sh """
-                    docker build -t ${DOCKER_IMAGE} .
-                    aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${ECR_REPO_URL}
-                    docker push ${DOCKER_IMAGE}
-                    """
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
 
-        stage('Trivy Scan Docker Image') {
+        stage('Helm Chart Validation') {
             steps {
-                sh """
-                trivy image --exit-code 1 --severity HIGH,CRITICAL ${DOCKER_IMAGE}
-                """
-            }
-        }
-        
-    stage('Install/Upgrade MySQL') {
-    steps {
-        script {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access']]) {
-                sh """
-                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
-                    
-                    # Check if MySQL deployment exists and is running
-                    if ! kubectl get deployment mysql-db -n ${HELM_NAMESPACE} > /dev/null 2>&1; then
-                        echo "MySQL deployment not found. Installing..."
-                        helm upgrade --install mysql-release ./petclinic-chart \
-                            --namespace ${HELM_NAMESPACE} \
-                            --create-namespace \
-                            -f ./petclinic-chart/values.yaml \
-                            --set app.enabled=false \
-                            --set mysql.enabled=true
-                    else
-                        echo "MySQL deployment already exists and running. Skipping deployment."
+                echo 'Validating Helm chart and rendered Kubernetes manifests'
+
+                sh '''
+                    set -eu
+
+                    helm lint "$HELM_CHART"
+
+                    if ! grep -q 'imagePullSecrets:' \
+                        "$HELM_CHART/templates/deployment.yaml"; then
+                        echo "ERROR: imagePullSecrets is missing from the deployment template."
+                        echo "Add imagePullSecrets under the Pod spec and commit the fix to develop."
+                        exit 1
                     fi
-                """
-            }
-        }
-    }
-}
 
-stage('Check MySQL Health') {
-    steps {
-        script {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access']]) {
-                sh """
-                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
-                    kubectl wait --namespace ${HELM_NAMESPACE} --for=condition=ready pod -l app=mysql --timeout=300s
-                """
-            }
-        }
-    }
-}
-
-stage('Deploy PetClinic Application') {
-    steps {
-        script {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access']]) {
-                sh """
-                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
-                    
-                    # Get current image tag from deployment if it exists
-                    CURRENT_TAG=\$(kubectl get deployment petclinic -n ${HELM_NAMESPACE} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | cut -d ':' -f2 || echo "")
-                    
-                    if [ "\$CURRENT_TAG" != "${IMAGE_TAG}" ]; then
-                        echo "New version detected (Current: \$CURRENT_TAG, New: ${IMAGE_TAG}). Deploying updates..."
-                        helm upgrade --install petclinic ./petclinic-chart \
-                            --namespace ${HELM_NAMESPACE} \
-                            -f ./petclinic-chart/values.yaml \
-                            --set app.image.tag=${IMAGE_TAG} \
-                            --set mysql.enabled=false
-                    else
-                        echo "Application is already running with the latest version (${IMAGE_TAG}). Skipping deployment."
+                    if ! grep -q 'ecr-registry-secret' \
+                        "$HELM_CHART/templates/deployment.yaml"; then
+                        echo "ERROR: The deployment template does not reference ecr-registry-secret."
+                        exit 1
                     fi
-                """
-            }
-        }
-    }
-}
 
-stage('Check PetClinic Health') {
-    steps {
-        script {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access']]) {
-                sh """
-                    aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
-                    kubectl wait --namespace ${HELM_NAMESPACE} --for=condition=ready pod -l app=petclinic --timeout=300s
-                """
+                    helm template "$HELM_RELEASE" "$HELM_CHART" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --set-string image.repository="$ECR_IMAGE" \
+                        --set-string image.tag="$IMAGE_TAG" \
+                        --set-string image.pullPolicy=IfNotPresent \
+                        > rendered-petclinic.yaml
+
+                    echo "Checking rendered image:"
+                    if ! grep -Fq "$ECR_IMAGE:$IMAGE_TAG" rendered-petclinic.yaml; then
+                        echo "ERROR: Expected image was not found in rendered manifests."
+                        grep -n 'image:' rendered-petclinic.yaml || true
+                        exit 1
+                    fi
+
+                    grep -F "$ECR_IMAGE:$IMAGE_TAG" rendered-petclinic.yaml
+
+                    echo "Checking rendered ECR pull secret:"
+                    if ! grep -q 'imagePullSecrets:' rendered-petclinic.yaml; then
+                        echo "ERROR: imagePullSecrets is missing from rendered manifests."
+                        exit 1
+                    fi
+
+                    if ! grep -q 'name: ecr-registry-secret' rendered-petclinic.yaml; then
+                        echo "ERROR: ecr-registry-secret is missing from rendered manifests."
+                        grep -n -A 5 -B 5 'imagePullSecrets' rendered-petclinic.yaml || true
+                        exit 1
+                    fi
+
+                    grep -n -A 4 -B 3 'imagePullSecrets' rendered-petclinic.yaml
+
+                    echo "Helm chart validation passed."
+                '''
             }
         }
-    }
-}
-       
+
+        stage('Docker Build') {
+            steps {
+                echo 'Building the PetClinic Docker image'
+
+                sh '''
+                    set -eu
+
+                    docker build \
+                        --pull \
+                        -t "$ECR_IMAGE:$IMAGE_TAG" \
+                        .
+                '''
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                echo 'Scanning the Docker image for security findings'
+
+                sh '''
+                    set -eu
+
+                    trivy image \
+                        --cache-dir "$TRIVY_CACHE_DIR" \
+                        --scanners vuln \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        "$ECR_IMAGE:$IMAGE_TAG"
+                '''
+            }
+        }
+
+        stage('Push Image to ECR') {
+            steps {
+                echo 'Authenticating with Amazon ECR and pushing the image'
+
+                sh '''
+                    set -eu
+
+                    aws sts get-caller-identity
+
+                    aws ecr get-login-password \
+                        --region "$AWS_REGION" \
+                    | docker login \
+                        --username AWS \
+                        --password-stdin "$ECR_REGISTRY"
+
+                    docker push "$ECR_IMAGE:$IMAGE_TAG"
+
+                    echo "Image pushed successfully:"
+                    echo "$ECR_IMAGE:$IMAGE_TAG"
+                '''
+            }
+        }
+
+        stage('Kubernetes Pre-deployment Checks') {
+            steps {
+                echo 'Checking cluster access and refreshing ECR credentials'
+
+                sh '''
+                    set -eu
+
+                    echo "Checking Kubernetes context:"
+                    kubectl config current-context
+
+                    echo "Checking cluster nodes:"
+                    kubectl get nodes
+
+                    echo "Checking namespace:"
+                    kubectl get namespace "$K8S_NAMESPACE"
+
+                    echo "Checking application database secret:"
+                    kubectl get secret petclinic-db-secret \
+                        --namespace "$K8S_NAMESPACE"
+
+                    echo "Checking Helm release:"
+                    helm status "$HELM_RELEASE" \
+                        --namespace "$K8S_NAMESPACE"
+
+                    aws sts get-caller-identity
+
+                    echo "Refreshing ECR pull secret:"
+                    ECR_PASSWORD="$(aws ecr get-login-password \
+                        --region "$AWS_REGION")"
+
+                    kubectl create secret docker-registry ecr-registry-secret \
+                        --namespace "$K8S_NAMESPACE" \
+                        --docker-server="$ECR_REGISTRY" \
+                        --docker-username=AWS \
+                        --docker-password="$ECR_PASSWORD" \
+                        --dry-run=client \
+                        -o yaml \
+                    | kubectl apply -f -
+
+                    unset ECR_PASSWORD
+
+                    echo "ECR pull secret refreshed successfully."
+                '''
+            }
+        }
+
+        stage('Helm Deploy') {
+            steps {
+                echo 'Deploying PetClinic using Helm'
+
+                sh '''
+                    set -eu
+
+                    helm upgrade --install "$HELM_RELEASE" "$HELM_CHART" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --set-string image.repository="$ECR_IMAGE" \
+                        --set-string image.tag="$IMAGE_TAG" \
+                        --set-string image.pullPolicy=IfNotPresent \
+                        --rollback-on-failure \
+                        --wait \
+                        --timeout 5m
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                echo 'Verifying the PetClinic deployment'
+
+                sh '''
+                    set -eu
+
+                    kubectl rollout status \
+                        "deployment/$HELM_RELEASE" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --timeout=300s
+
+                    echo "Deployment:"
+                    kubectl get deployment "$HELM_RELEASE" \
+                        --namespace "$K8S_NAMESPACE"
+
+                    echo "Pods:"
+                    kubectl get pods \
+                        --namespace "$K8S_NAMESPACE" \
+                        -o wide
+
+                    echo "Services:"
+                    kubectl get services \
+                        --namespace "$K8S_NAMESPACE"
+
+                    echo "Helm release:"
+                    helm status "$HELM_RELEASE" \
+                        --namespace "$K8S_NAMESPACE"
+
+                    echo "Deployment verification completed."
+                '''
+            }
+        }
     }
 
     post {
-        always {
-            cleanWs()
-            sh """
-            docker image prune -f
-            docker container prune -f
+        success {
+            echo """
+                PIPELINE SUCCESS
+
+                Image: ${env.ECR_IMAGE}:${env.IMAGE_TAG}
+                Namespace: ${env.K8S_NAMESPACE}
+                Helm release: ${env.HELM_RELEASE}
+
+                Trivy findings were reported but did not block the build.
             """
+        }
+
+        failure {
+            echo """
+                PIPELINE FAILED
+
+                Inspect the first failed stage in Console Output.
+                Do not delete existing Kubernetes workloads to troubleshoot.
+            """
+        }
+
+        always {
+            echo 'Pipeline execution finished.'
         }
     }
 }
