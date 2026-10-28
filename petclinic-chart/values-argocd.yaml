@@ -1,5 +1,4 @@
-replicaCount: 1
-
+replicaCount: 2
 image:
   repository: 141145000253.dkr.ecr.us-east-1.amazonaws.com/test-project1
   tag: "20-97bf0d1"
