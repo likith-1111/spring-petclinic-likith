@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: 141145000253.dkr.ecr.us-east-1.amazonaws.com/test-project1
-  tag: "2-bcea963"
+  tag: "20-97bf0d1"
   pullPolicy: Always
 
 service:
